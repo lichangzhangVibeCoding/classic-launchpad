@@ -4,9 +4,21 @@ macOS Tahoe 把全屏启动台换成了窗口里的「应用程序」。这个�
 
 ![启动台](screenshots/launchpad.jpg)
 
-## 使用
+## 下载
 
-编译完成后打开「启动台」，也可以点菜单栏上的图标。快捷键是 **Control + Option + 空格**。
+不想自己编译，可以直接下载安装包。支持 Apple 芯片和 Intel，需要 macOS 13 或更高版本。
+
+[下载启动台 1.0](https://github.com/lichangzhangVibeCoding/classic-launchpad/releases/download/v1.0.0/ClassicLaunchpad-1.0-mac.zip)
+
+解压后把「启动台」拖进「应用程序」文件夹，再双击打开。也可以点菜单栏上的图标。快捷键是 **Control + Option + 空格**。
+
+第一次打开时，系统可能会提示无法验证开发者。在「应用程序」里按住 Control 点「启动台」，选择「打开」。如果还是打不开，在终端执行：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/启动台.app
+```
+
+## 使用
 
 - 在触控板上左右滑动翻页，页面跟着指头走。到第一页或最后一页再往外拉，会轻轻回弹。
 - 顶部可以搜索，中文和拼音都行。
