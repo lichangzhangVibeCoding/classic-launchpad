@@ -484,13 +484,22 @@ final class CenterLabel: NSView {
         let style = NSMutableParagraphStyle()
         style.alignment = .center
         style.lineBreakMode = .byTruncatingTail
+        let font = NSFont.systemFont(ofSize: 28, weight: .medium)
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 18, weight: .medium),
+            .font: font,
             .foregroundColor: NSColor.white,
             .shadow: shadow,
             .paragraphStyle: style
         ]
-        (title as NSString).draw(in: bounds.insetBy(dx: 8, dy: 4), withAttributes: attributes)
+        let text = title as NSString
+        let size = text.size(withAttributes: attributes)
+        let rect = CGRect(
+            x: 8,
+            y: max(0, (bounds.height - size.height) / 2),
+            width: max(0, bounds.width - 16),
+            height: size.height
+        )
+        text.draw(in: rect, withAttributes: attributes)
     }
 
     override func mouseDown(with event: NSEvent) { onClick?() }
@@ -527,7 +536,9 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
     let folderOverlay = RootView()
     let folderDim = DimView()
     let folderPanel = FolderPanel()
+    let folderClip = RootView()
     let folderGrid = RootView()
+    let folderSide = RootView()
     let folderTitle = NSTextField()
     let folderNameLabel = CenterLabel()
     let folderDots = PageDots()
@@ -542,6 +553,21 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
     var openFolderID: String?
     var folderPage = 0
     var folderSelection: Int?
+    private var folderOffset: CGFloat = 0
+    private var folderRaw: CGFloat = 0
+    private var folderSideIndex: Int?
+    private var folderTracking = false
+    private var folderSpringing = false
+    private var folderSpringTarget: CGFloat = 0
+    private var folderSpringVelocity: CGFloat = 0
+    private var folderSpringCommit: Int?
+    private var folderSpringStarted = Date()
+    private var folderLastTick = Date()
+    private var folderPagerTimer: Timer?
+    private var folderMotionTimer: Timer?
+    private var folderMotion = false
+    private var folderClosing = false
+    private var folderSource = CGPoint.zero
     private var wallpaperCache: NSImage?
     private var wallpaperScreenID: String?
     private var scrollAccumX: CGFloat = 0
@@ -564,7 +590,9 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
     private var allowsAnimation = true
     private var dragGrab = CGPoint.zero
     private var lastSlot: Int?
+    private var lastFolderSlot: Int?
     private var mergeToken: String?
+    private var folderWillEject = false
     private var edgeStamp: Date?
     private var lastPageTurn = Date.distantPast
     private var lastDragPoint = CGPoint.zero
@@ -611,7 +639,7 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
             present()
             library.reload { [weak self] in
                 guard let self, self.visible, self.dragToken == nil else { return }
-                if self.trackingPage || self.springing { return }
+                if self.trackingPage || self.springing || self.folderTracking || self.folderSpringing || self.folderMotion { return }
                 self.refresh(direction: 0)
             }
         }
@@ -663,15 +691,23 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
     }
 
     func openFolder(_ id: String, source: IconCell?) {
-        guard library.folder(id) != nil else { return }
+        guard library.folder(id) != nil, !folderClosing else { return }
+        if let source, source.window != nil {
+            let local = source.iconBounds.width > 2
+                ? CGPoint(x: source.iconBounds.midX, y: source.iconBounds.midY)
+                : CGPoint(x: source.bounds.midX, y: source.bounds.midY)
+            folderSource = folderOverlay.convert(local, from: source)
+        } else {
+            folderSource = CGPoint(x: root.bounds.midX, y: root.bounds.midY)
+        }
+        stopPager()
+        stopFolderPager()
         openFolderID = id
         folderPage = 0
-        folderSelection = 0
-        keyboardActive = true
+        folderSelection = nil
         openingFolder = true
         refresh(direction: 0)
         openingFolder = false
-        _ = source
     }
 
     func launch(_ id: String, source: IconCell?) {
@@ -685,7 +721,7 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
     }
 
     func handleMouse(on cell: IconCell, event: NSEvent) {
-        if cell.isInFolder || !query.isEmpty {
+        if !query.isEmpty {
             trackClick(cell)
             return
         }
@@ -699,7 +735,7 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
                 inMode: .eventTracking,
                 dequeue: true
             ) else {
-                if dragged { checkEdgeWhileStationary() }
+                if dragged, !cell.isInFolder { checkEdgeWhileStationary() }
                 continue
             }
             if next.type == .leftMouseUp { break }
@@ -790,7 +826,7 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
         folderTitle.focusRingType = .none
         folderTitle.alignment = .center
         folderTitle.textColor = .white
-        folderTitle.font = .systemFont(ofSize: 18, weight: .medium)
+        folderTitle.font = .systemFont(ofSize: 28, weight: .medium)
         let titleShadow = NSShadow()
         titleShadow.shadowColor = NSColor.black.withAlphaComponent(0.75)
         titleShadow.shadowBlurRadius = 4
@@ -822,7 +858,12 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
         root.addSubview(folderOverlay)
         folderOverlay.addSubview(folderDim)
         folderOverlay.addSubview(folderPanel)
-        folderPanel.addSubview(folderGrid)
+        folderClip.wantsLayer = true
+        folderClip.layer?.masksToBounds = true
+        folderPanel.addSubview(folderClip)
+        folderClip.addSubview(folderSide)
+        folderClip.addSubview(folderGrid)
+        folderSide.isHidden = true
         folderPanel.addSubview(folderDots)
         folderOverlay.addSubview(folderTitle)
         folderOverlay.addSubview(folderNameLabel)
@@ -834,10 +875,7 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
             self?.window.makeFirstResponder(self?.search.field)
         }
         dots.onPick = { [weak self] index in self?.goToPage(index) }
-        folderDots.onPick = { [weak self] index in
-            self?.folderPage = index
-            self?.refresh(direction: 0)
-        }
+        folderDots.onPick = { [weak self] index in self?.goToFolderPage(index) }
         let background: () -> Void = { [weak self] in
             self?.backgroundClick()
         }
@@ -848,6 +886,7 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
         canvas.onMouseDown = background
         side.onMouseDown = background
         folderGrid.onMouseDown = background
+        folderSide.onMouseDown = background
         dots.onMiss = background
         folderDots.onMiss = background
         root.onScroll = { [weak self] event in self?.handleScroll(event) }
@@ -1292,7 +1331,11 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
     }
 
     private func handleScroll(_ event: NSEvent) {
-        guard openFolderID == nil, dragToken == nil else { return }
+        guard dragToken == nil, !folderMotion else { return }
+        if openFolderID != nil {
+            handleFolderScroll(event)
+            return
+        }
         let phase = event.phase
         let momentum = event.momentumPhase
         if !momentum.isEmpty { return }
@@ -1434,12 +1477,37 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
     }
 
     private func closeFolder() {
+        guard openFolderID != nil, !folderClosing else { return }
         if folderTitle.currentEditor() != nil {
             commitFolderTitle()
         }
+        stopFolderPager()
+        guard allowsAnimation else {
+            dismissFolder()
+            return
+        }
+        startFolderCloseAnimation { [weak self] in
+            self?.dismissFolder()
+        }
+    }
+
+    private func dismissFolder() {
+        folderMotionTimer?.invalidate()
+        folderMotionTimer = nil
+        folderMotion = false
+        folderClosing = false
         openFolderID = nil
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         folderOverlay.isHidden = true
+        folderDim.alphaValue = 1
+        for view in [folderPanel, folderNameLabel, folderTitle] as [NSView] {
+            view.alphaValue = 1
+            view.layer?.transform = CATransform3DIdentity
+        }
+        CATransaction.commit()
         window.makeFirstResponder(search.field)
+        refresh(direction: 0)
     }
 
     private func folderApps(_ id: String) -> [AppInfo] {
@@ -1447,24 +1515,31 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
     }
 
     private func layoutFolder() {
-        guard let folderID = openFolderID, let folder = library.folder(folderID) else {
+        guard let folderID = openFolderID else {
             folderOverlay.isHidden = true
             return
         }
-        folderOverlay.isHidden = false
+        guard let folder = library.folder(folderID) else {
+            openFolderID = nil
+            folderOverlay.isHidden = true
+            return
+        }
+        let animateOpen = openingFolder && allowsAnimation
+        if !animateOpen {
+            folderOverlay.isHidden = false
+        }
         let apps = folderApps(folderID)
         let perPage = 12
         let pages = max(1, Int(ceil(Double(max(apps.count, 1)) / Double(perPage))))
         if folderPage >= pages { folderPage = max(0, pages - 1) }
-        let start = folderPage * perPage
-        let slice = Array(apps.dropFirst(start).prefix(perPage))
+        if folderTracking || folderSpringing { return }
+        let sliceCount = min(perPage, max(0, apps.count - folderPage * perPage))
         let columns = 4
         let rows = 3
         let cellW: CGFloat = 136
         let cellH: CGFloat = 124
-        let icon: CGFloat = 72
         let pad: CGFloat = 28
-        let visibleRows = pages > 1 ? rows : min(rows, max(1, Int(ceil(Double(slice.count) / Double(columns)))))
+        let visibleRows = pages > 1 ? rows : min(rows, max(1, Int(ceil(Double(sliceCount) / Double(columns)))))
         let gridW = cellW * CGFloat(columns)
         let gridH = cellH * CGFloat(visibleRows)
         let extra: CGFloat = pages > 1 ? 22 : 0
@@ -1476,13 +1551,26 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
             height: panelSize.height
         )
         folderPanel.frame = panelFrame
-        folderGrid.frame = CGRect(x: pad, y: pad, width: gridW, height: gridH)
+        folderClip.frame = CGRect(x: pad, y: pad, width: gridW, height: gridH)
+        folderGrid.frame = folderClip.bounds
+        folderSide.frame = folderClip.bounds
+        folderSide.isHidden = true
+        folderOffset = 0
+        folderRaw = 0
         folderDots.frame = CGRect(x: pad, y: pad + gridH + 2, width: gridW, height: 18)
         folderDots.count = pages
         folderDots.index = folderPage
         folderDots.isHidden = pages <= 1
-        dots.isHidden = true
-        let titleFrame = CGRect(x: panelFrame.midX - 180, y: panelFrame.maxY + 14, width: 360, height: 34)
+        if !animateOpen {
+            dots.isHidden = true
+        }
+        let titleH: CGFloat = 46
+        let titleFrame = CGRect(
+            x: panelFrame.midX - 240,
+            y: panelFrame.minY - 18 - titleH,
+            width: 480,
+            height: titleH
+        )
         folderTitle.frame = titleFrame
         folderNameLabel.frame = titleFrame
         if folderTitle.currentEditor() == nil {
@@ -1491,8 +1579,28 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
             folderTitle.isHidden = true
             folderNameLabel.isHidden = false
         }
-        for view in folderGrid.subviews { view.removeFromSuperview() }
+        populateFolder(folderGrid, page: folderPage)
+        if openingFolder && allowsAnimation {
+            startFolderOpenAnimation()
+        } else if !folderMotion {
+            resetFolderMotion()
+            folderOverlay.alphaValue = 1
+        }
+    }
+
+    private func populateFolder(_ host: NSView, page: Int) {
+        guard let folderID = openFolderID else { return }
+        let apps = folderApps(folderID)
+        let perPage = 12
+        let start = page * perPage
+        let slice = Array(apps.dropFirst(start).prefix(perPage))
+        let columns = 4
+        let cellW: CGFloat = 136
+        let cellH: CGFloat = 124
+        let icon: CGFloat = 72
+        host.subviews.forEach { $0.removeFromSuperview() }
         for (index, app) in slice.enumerated() {
+            if dragToken == "app:\(app.id)" { continue }
             let entry = Entry(
                 token: "app:\(app.id)",
                 title: app.name,
@@ -1510,16 +1618,7 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
             cell.frame = CGRect(x: CGFloat(column) * cellW, y: CGFloat(row) * cellH, width: cellW, height: cellH)
             cell.configure(entry, iconSize: icon)
             cell.selected = keyboardActive && folderSelection == start + index
-            folderGrid.addSubview(cell)
-        }
-        if openingFolder && allowsAnimation {
-            folderOverlay.alphaValue = 0
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.2
-                self.folderOverlay.animator().alphaValue = 1
-            }
-        } else {
-            folderOverlay.alphaValue = 1
+            host.addSubview(cell)
         }
     }
 
@@ -1527,6 +1626,12 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
         guard let folderID = openFolderID else { return }
         let apps = folderApps(folderID)
         guard !apps.isEmpty else { return }
+        keyboardActive = true
+        if folderSelection == nil {
+            folderSelection = 0
+            updateFolderSelection()
+            return
+        }
         let columns = 4
         var index = folderSelection ?? 0
         if dx != 0 { index += dx }
@@ -1534,9 +1639,382 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
         index = max(0, min(apps.count - 1, index))
         folderSelection = index
         let newPage = index / 12
-        folderPage = newPage
-        keyboardActive = true
-        refresh(direction: 0)
+        if newPage != folderPage {
+            goToFolderPage(newPage)
+        } else {
+            updateFolderSelection()
+        }
+    }
+
+    private func updateFolderSelection() {
+        guard let folderID = openFolderID else { return }
+        let start = folderPage * 12
+        let apps = folderApps(folderID)
+        for case let cell as IconCell in folderGrid.subviews {
+            let index = apps.firstIndex { $0.id == cell.appID } ?? -1
+            cell.selected = keyboardActive && index == folderSelection && index >= start && index < start + 12
+        }
+    }
+
+    private func folderPageCount() -> Int {
+        guard let id = openFolderID else { return 1 }
+        return max(1, Int(ceil(Double(max(folderApps(id).count, 1)) / 12.0)))
+    }
+
+    private func handleFolderScroll(_ event: NSEvent) {
+        let phase = event.phase
+        let momentum = event.momentumPhase
+        if !momentum.isEmpty { return }
+        if phase.contains(.began) {
+            if folderSpringing {
+                folderPagerTimer?.invalidate()
+                folderPagerTimer = nil
+                folderSpringing = false
+                folderSpringCommit = nil
+                folderRaw = folderOffset
+                folderSpringVelocity = 0
+                folderDots.index = folderPage
+                folderDots.needsDisplay = true
+            } else {
+                folderRaw = 0
+                folderOffset = 0
+            }
+            resetScrollGesture()
+            fingerVelocity = 0
+            lastScrollTime = event.timestamp
+        }
+        if phase.contains(.cancelled) {
+            folderSpringVelocity = 0
+            fingerVelocity = 0
+            folderRaw = folderOffset
+            startFolderSpring(to: 0, commit: nil)
+            return
+        }
+        let live = phase.contains(.began) || phase.contains(.changed) || phase.contains(.ended)
+        if live {
+            let delta = fingerDeltaX(event)
+            scrollAccumX += delta
+            scrollAccumY += event.scrollingDeltaY
+            if !scrollAxisLocked, max(abs(scrollAccumX), abs(scrollAccumY)) > 8 {
+                scrollAxisLocked = true
+                scrollIsHorizontal = abs(scrollAccumX) > abs(scrollAccumY) * 0.85
+                if scrollIsHorizontal { trackFolder(delta: scrollAccumX, time: event.timestamp) }
+            } else if scrollAxisLocked, scrollIsHorizontal {
+                trackFolder(delta: delta, time: event.timestamp)
+            }
+            if phase.contains(.ended) {
+                if folderTracking || abs(folderOffset) > 0.5 {
+                    settleFolderPage()
+                } else {
+                    resetScrollGesture()
+                }
+            }
+            return
+        }
+        if !event.hasPreciseScrollingDeltas {
+            let delta = fingerDeltaX(event)
+            let horizontal = abs(delta) >= abs(event.scrollingDeltaY) && (abs(delta) > 0.01 || abs(event.deltaX) > 0.01)
+            if horizontal {
+                let step = delta != 0 ? delta : -event.deltaX
+                if step < 0 { goToFolderPage(folderPage + 1) } else if step > 0 { goToFolderPage(folderPage - 1) }
+            }
+        }
+    }
+
+    private func trackFolder(delta: CGFloat, time: TimeInterval) {
+        let width = max(folderClip.bounds.width, 1)
+        let gained = delta * max(1.35, width / 720)
+        let capped = min(width * 0.42, max(-width * 0.42, gained))
+        folderRaw += capped
+        noteVelocity(capped, time: time)
+        folderOffset = resistedFolderOffset(folderRaw)
+        folderTracking = true
+        syncFolderNeighbor()
+    }
+
+    private func resistedFolderOffset(_ raw: CGFloat) -> CGFloat {
+        let width = max(folderClip.bounds.width, 1)
+        let lower: CGFloat = folderPage > 0 ? -width : 0
+        let upper: CGFloat = folderPage + 1 < folderPageCount() ? width : 0
+        if raw < lower { return lower - rubberBand(lower - raw) }
+        if raw > upper { return upper + rubberBand(raw - upper) }
+        return raw
+    }
+
+    private func syncFolderNeighbor() {
+        let want: Int?
+        if folderOffset < -1, folderPage + 1 < folderPageCount() {
+            want = folderPage + 1
+        } else if folderOffset > 1, folderPage > 0 {
+            want = folderPage - 1
+        } else {
+            want = nil
+        }
+        guard want != folderSideIndex else {
+            layoutFolderStrip()
+            return
+        }
+        folderSideIndex = want
+        if let want {
+            populateFolder(folderSide, page: want)
+        } else {
+            folderSide.subviews.forEach { $0.removeFromSuperview() }
+        }
+        layoutFolderStrip()
+    }
+
+    private func layoutFolderStrip() {
+        let bounds = folderClip.bounds
+        guard bounds.width > 1, bounds.height > 1 else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        folderGrid.frame = CGRect(x: folderOffset, y: 0, width: bounds.width, height: bounds.height)
+        if let folderSideIndex {
+            let direction: CGFloat = folderSideIndex > folderPage ? 1 : -1
+            folderSide.frame = CGRect(x: folderOffset + direction * bounds.width, y: 0, width: bounds.width, height: bounds.height)
+            folderSide.isHidden = false
+        } else {
+            folderSide.isHidden = true
+        }
+        CATransaction.commit()
+    }
+
+    private func settleFolderPage() {
+        let width = max(folderClip.bounds.width, 1)
+        let trigger = width * 0.14
+        var target: CGFloat = 0
+        var commit: Int?
+        if fingerVelocity > 1050, folderPage > 0 {
+            target = width
+            commit = folderPage - 1
+        } else if fingerVelocity < -1050, folderPage + 1 < folderPageCount() {
+            target = -width
+            commit = folderPage + 1
+        } else if folderOffset > trigger, folderPage > 0 {
+            target = width
+            commit = folderPage - 1
+        } else if folderOffset < -trigger, folderPage + 1 < folderPageCount() {
+            target = -width
+            commit = folderPage + 1
+        }
+        if let commit, folderSideIndex != commit {
+            folderSideIndex = commit
+            populateFolder(folderSide, page: commit)
+        }
+        let atEdge = commit == nil && ((folderOffset > 0 && folderPage == 0) || (folderOffset < 0 && folderPage + 1 >= folderPageCount()))
+        folderSpringVelocity = atEdge ? fingerVelocity * 0.3 : fingerVelocity
+        folderRaw = folderOffset
+        startFolderSpring(to: target, commit: commit)
+    }
+
+    private func goToFolderPage(_ newPage: Int) {
+        let pages = folderPageCount()
+        guard newPage >= 0, newPage < pages else { return }
+        if folderSpringing {
+            finishFolderSpring()
+        } else if folderTracking {
+            stopFolderPager()
+        }
+        guard newPage != folderPage else { return }
+        guard allowsAnimation else {
+            folderPage = newPage
+            layoutFolder()
+            return
+        }
+        let width = max(folderClip.bounds.width, 1)
+        folderSideIndex = newPage
+        populateFolder(folderSide, page: newPage)
+        let direction: CGFloat = newPage > folderPage ? -1 : 1
+        folderSpringVelocity = direction * width * 1.35
+        startFolderSpring(to: direction * width, commit: newPage)
+    }
+
+    private func startFolderSpring(to target: CGFloat, commit: Int?) {
+        folderSpringTarget = target
+        folderSpringCommit = commit
+        folderSpringing = true
+        folderTracking = false
+        folderSpringStarted = Date()
+        folderLastTick = folderSpringStarted
+        layoutFolderStrip()
+        folderDots.index = commit ?? folderPage
+        folderDots.needsDisplay = true
+        folderPagerTimer?.invalidate()
+        let timer = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
+            self?.stepFolderSpring()
+        }
+        folderPagerTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stepFolderSpring() {
+        guard folderSpringing else { return }
+        let now = Date()
+        var dt = CGFloat(now.timeIntervalSince(folderLastTick))
+        folderLastTick = now
+        if dt <= 0 || dt > 1.0 / 30 { dt = 1.0 / 120 }
+        let stiffness: CGFloat = 460
+        let damping: CGFloat = 43
+        folderSpringVelocity += (-stiffness * (folderOffset - folderSpringTarget) - damping * folderSpringVelocity) * dt
+        folderOffset += folderSpringVelocity * dt
+        layoutFolderStrip()
+        let arrived = abs(folderOffset - folderSpringTarget) < 8 && abs(folderSpringVelocity) < 90
+        if arrived || now.timeIntervalSince(folderSpringStarted) > 0.7 {
+            finishFolderSpring()
+        }
+    }
+
+    private func finishFolderSpring() {
+        folderPagerTimer?.invalidate()
+        folderPagerTimer = nil
+        let landed = folderSpringCommit
+        folderSpringing = false
+        folderTracking = false
+        folderSpringCommit = nil
+        folderSpringVelocity = 0
+        fingerVelocity = 0
+        folderOffset = 0
+        folderRaw = 0
+        folderSideIndex = nil
+        folderSide.subviews.forEach { $0.removeFromSuperview() }
+        folderSide.isHidden = true
+        if let landed { folderPage = landed }
+        resetScrollGesture()
+        layoutFolder()
+        updateFolderSelection()
+    }
+
+    private func stopFolderPager() {
+        folderPagerTimer?.invalidate()
+        folderPagerTimer = nil
+        folderSpringing = false
+        folderTracking = false
+        folderSpringCommit = nil
+        folderSpringVelocity = 0
+        folderOffset = 0
+        folderRaw = 0
+        folderSideIndex = nil
+        folderSide.subviews.forEach { $0.removeFromSuperview() }
+        folderSide.isHidden = true
+        if folderClip.bounds.width > 1 {
+            folderGrid.frame = folderClip.bounds
+        }
+        resetScrollGesture()
+    }
+
+    private func centerAnchor(_ view: NSView) {
+        view.wantsLayer = true
+        guard let layer = view.layer else { return }
+        let desired = CGPoint(x: 0.5, y: 0.5)
+        guard layer.anchorPoint != desired else { return }
+        let bounds = view.bounds
+        let old = layer.anchorPoint
+        let dx = (desired.x - old.x) * bounds.width
+        let dy = (desired.y - old.y) * bounds.height
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.anchorPoint = desired
+        layer.position = CGPoint(x: layer.position.x + dx, y: layer.position.y + dy)
+        CATransaction.commit()
+    }
+
+    private func folderTransform(_ view: NSView, scale: CGFloat, anchor: CGPoint) -> CATransform3D {
+        let center = CGPoint(x: view.frame.midX, y: view.frame.midY)
+        let dx = (anchor.x - center.x) * (1 - scale)
+        let dy = (anchor.y - center.y) * (1 - scale)
+        var transform = CATransform3DIdentity
+        transform = CATransform3DTranslate(transform, dx, dy, 0)
+        transform = CATransform3DScale(transform, scale, scale, 1)
+        return transform
+    }
+
+    private func applyFolderPose(_ progress: CGFloat, anchor: CGPoint) {
+        let scale = max(0.06, 0.16 + 0.84 * progress)
+        let shown = min(1, max(0, progress))
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        folderDim.alphaValue = shown
+        if shown > 0.2 {
+            dots.isHidden = true
+        }
+        for view in [folderPanel, folderNameLabel] as [NSView] {
+            view.alphaValue = shown
+            view.layer?.transform = folderTransform(view, scale: scale, anchor: anchor)
+        }
+        CATransaction.commit()
+    }
+
+    private func resetFolderMotion() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        folderDim.alphaValue = 1
+        for view in [folderPanel, folderNameLabel, folderTitle] as [NSView] {
+            view.alphaValue = 1
+            view.layer?.transform = CATransform3DIdentity
+        }
+        CATransaction.commit()
+    }
+
+    private func startFolderOpenAnimation() {
+        folderMotionTimer?.invalidate()
+        centerAnchor(folderPanel)
+        centerAnchor(folderNameLabel)
+        folderMotion = true
+        applyFolderPose(0, anchor: folderSource)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        folderOverlay.alphaValue = 1
+        folderOverlay.isHidden = false
+        CATransaction.commit()
+        var value: CGFloat = 0
+        var velocity: CGFloat = 0
+        var last = Date()
+        let started = last
+        applyFolderPose(value, anchor: folderSource)
+        let timer = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            let now = Date()
+            var dt = CGFloat(now.timeIntervalSince(last))
+            last = now
+            if dt <= 0 || dt > 1.0 / 30 { dt = 1.0 / 120 }
+            let stiffness: CGFloat = 340
+            let damping: CGFloat = 28
+            velocity += (-stiffness * (value - 1) - damping * velocity) * dt
+            value += velocity * dt
+            self.applyFolderPose(value, anchor: self.folderSource)
+            let arrived = abs(value - 1) < 0.012 && abs(velocity) < 0.08
+            if arrived || now.timeIntervalSince(started) > 0.62 {
+                timer.invalidate()
+                self.folderMotionTimer = nil
+                self.folderMotion = false
+                self.resetFolderMotion()
+            }
+        }
+        folderMotionTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func startFolderCloseAnimation(completion: @escaping () -> Void) {
+        folderMotionTimer?.invalidate()
+        centerAnchor(folderPanel)
+        centerAnchor(folderNameLabel)
+        folderMotion = true
+        folderClosing = true
+        let started = Date()
+        let duration: TimeInterval = 0.26
+        let timer = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            let t = min(1, Date().timeIntervalSince(started) / duration)
+            let progress = 1 - t * t
+            self.applyFolderPose(progress, anchor: self.folderSource)
+            if t >= 1 {
+                timer.invalidate()
+                self.folderMotionTimer = nil
+                completion()
+            }
+        }
+        folderMotionTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     private func folderCell(appID: String) -> IconCell? {
@@ -1554,23 +2032,30 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
 
     private func beginDrag(_ cell: IconCell, event: NSEvent) {
         dragToken = cell.token
-        let local = cell.convert(event.locationInWindow, from: nil)
-        dragGrab = local
-        let frame = dragLayer.convert(cell.frame, from: cell.superview)
+        dragGrab = cell.convert(event.locationInWindow, from: nil)
+        let host: NSView = cell.isInFolder ? folderOverlay : dragLayer
+        let frame = host.convert(cell.frame, from: cell.superview)
         cell.removeFromSuperview()
-        dragLayer.isHidden = false
-        dragLayer.addSubview(cell)
+        if host === dragLayer { dragLayer.isHidden = false }
+        host.addSubview(cell)
         cell.frame = frame
         cell.setLifted(true)
         lastSlot = nil
+        lastFolderSlot = nil
         mergeToken = nil
-        lastDragPoint = dragLayer.convert(event.locationInWindow, from: nil)
+        folderWillEject = false
+        lastDragPoint = host.convert(event.locationInWindow, from: nil)
     }
 
     private func updateDrag(_ cell: IconCell, event: NSEvent) {
-        let point = dragLayer.convert(event.locationInWindow, from: nil)
-        lastDragPoint = point
+        let host = cell.superview ?? dragLayer
+        let point = host.convert(event.locationInWindow, from: nil)
         cell.frame.origin = CGPoint(x: point.x - dragGrab.x, y: point.y - dragGrab.y)
+        if cell.isInFolder {
+            updateFolderDrag(cell, windowPoint: event.locationInWindow)
+            return
+        }
+        lastDragPoint = point
         let canvasPoint = canvas.convert(event.locationInWindow, from: nil)
         if let target = mergeTarget(at: canvasPoint), canMerge(cell, onto: target) {
             if mergeToken != target.token {
@@ -1582,7 +2067,7 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
         } else {
             clearMergeHighlight()
             mergeToken = nil
-            if let slot = slot(at: canvasPoint), slot != lastSlot {
+            if let slot = slot(at: canvasPoint), slot != lastSlot, acceptsReorder(to: slot, point: canvasPoint, token: cell.token) {
                 lastSlot = slot
                 library.place(token: cell.token, at: slot, saveNow: false)
                 let itemPage = pageOf(token: cell.token)
@@ -1597,16 +2082,47 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
         turnPageIfNeeded(point: point, token: cell.token)
     }
 
+    private func updateFolderDrag(_ cell: IconCell, windowPoint: CGPoint) {
+        guard let appID = cell.appID, let folderID = openFolderID else { return }
+        let panel = folderPanel.convert(folderPanel.bounds, to: nil).insetBy(dx: -28, dy: -40)
+        if !panel.contains(windowPoint) {
+            folderWillEject = true
+            return
+        }
+        folderWillEject = false
+        let gridPoint = folderGrid.convert(windowPoint, from: nil)
+        guard let index = folderSlot(at: gridPoint), index != lastFolderSlot else { return }
+        lastFolderSlot = index
+        library.moveInsideFolder(appID: appID, folderID: folderID, to: index)
+        layoutFolder()
+        folderOverlay.addSubview(cell)
+    }
+
     private func endDrag(_ cell: IconCell) {
         let token = cell.token
         let merge = mergeToken
+        let inFolder = cell.isInFolder
+        let eject = folderWillEject
+        let appID = cell.appID
+        let folderID = openFolderID
         clearMergeHighlight()
         dragToken = nil
         lastSlot = nil
+        lastFolderSlot = nil
         mergeToken = nil
+        folderWillEject = false
         cell.setLifted(false)
         cell.removeFromSuperview()
         dragLayer.isHidden = true
+        if inFolder {
+            if eject, let appID, let folderID {
+                library.eject(appID: appID, from: folderID)
+            } else {
+                library.save()
+            }
+            refresh(direction: 0)
+            return
+        }
         if let merge, let target = GridItem(token: merge), case .app(let dragged) = GridItem(token: token) {
             switch target {
             case .app(let other):
@@ -1629,10 +2145,50 @@ final class LaunchpadController: NSObject, NSTextFieldDelegate, NSWindowDelegate
     private func mergeTarget(at point: CGPoint) -> IconCell? {
         for case let cell as IconCell in canvas.subviews {
             if cell.token == dragToken { continue }
-            let icon = cell.convert(cell.iconBounds, to: canvas)
+            let local = cell.iconBounds.insetBy(dx: -10, dy: -10)
+            let icon = local.width > 8
+                ? cell.convert(local, to: canvas)
+                : cell.convert(cell.bounds.insetBy(dx: cell.bounds.width * 0.28, dy: cell.bounds.height * 0.3), to: canvas)
             if icon.contains(point) { return cell }
         }
         return nil
+    }
+
+    private func occupant(at slot: Int) -> IconCell? {
+        let list = activeList()
+        guard slot >= 0, slot < list.count else { return nil }
+        let token = list[slot].token
+        if token == dragToken { return nil }
+        return canvas.subviews.compactMap { $0 as? IconCell }.first { $0.token == token }
+    }
+
+    /// Keep the icon under the pointer where it is, until the pointer has moved past its center.
+    private func acceptsReorder(to slot: Int, point: CGPoint, token: String) -> Bool {
+        guard let current = activeList().firstIndex(where: { $0.token == token }), slot != current else { return true }
+        guard let occupant = occupant(at: slot) else { return true }
+        let bounds = occupant.iconBounds
+        let center = bounds.width > 2
+            ? occupant.convert(CGPoint(x: bounds.midX, y: bounds.midY), to: canvas)
+            : occupant.convert(CGPoint(x: occupant.bounds.midX, y: occupant.bounds.midY), to: canvas)
+        let columns = metrics.columns
+        let passedX = slot % columns == current % columns
+            || (slot % columns > current % columns ? point.x >= center.x : point.x <= center.x)
+        let passedY = slot / columns == current / columns
+            || (slot / columns > current / columns ? point.y >= center.y : point.y <= center.y)
+        return passedX && passedY
+    }
+
+    private func folderSlot(at point: CGPoint) -> Int? {
+        let columns = 4
+        let cellW: CGFloat = 136
+        let cellH: CGFloat = 124
+        guard let folderID = openFolderID else { return nil }
+        let count = folderApps(folderID).count
+        guard count > 1 else { return nil }
+        guard point.x >= 0, point.y >= 0, point.x < folderGrid.bounds.width, point.y < folderGrid.bounds.height else { return nil }
+        let column = min(columns - 1, max(0, Int(point.x / cellW)))
+        let row = min(2, max(0, Int(point.y / cellH)))
+        return min(folderPage * 12 + row * columns + column, count - 1)
     }
 
     private func clearMergeHighlight() {

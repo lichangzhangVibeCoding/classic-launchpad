@@ -300,9 +300,10 @@ final class Library {
     }
 
     func makeFolder(draggedApp: String, targetApp: String) -> String? {
-        guard draggedApp != targetApp, apps[draggedApp] != nil, apps[targetApp] != nil else { return nil }
+        guard draggedApp != targetApp, let dragged = apps[draggedApp], let target = apps[targetApp] else { return nil }
+        let name = folderName(for: dragged, and: target)
         let id = UUID().uuidString
-        layout.folders[id] = FolderModel(name: nextFolderName(), apps: [targetApp, draggedApp])
+        layout.folders[id] = FolderModel(name: name, apps: [targetApp, draggedApp])
         var list = items
         if let index = list.firstIndex(of: .app(targetApp)) {
             list[index] = .folder(id)
@@ -327,15 +328,23 @@ final class Library {
     func eject(appID: String, from folderID: String) {
         guard var folder = layout.folders[folderID] else { return }
         folder.apps.removeAll { $0 == appID }
+        let alive = folder.apps.filter { apps[$0] != nil }
         var list = items
-        if folder.apps.isEmpty {
+        if alive.count <= 1 {
             layout.folders.removeValue(forKey: folderID)
             if let index = list.firstIndex(of: .folder(folderID)) {
-                list[index] = .app(appID)
+                if let only = alive.first {
+                    list[index] = .app(only)
+                    list.insert(.app(appID), at: index + 1)
+                } else {
+                    list[index] = .app(appID)
+                }
             } else {
+                if let only = alive.first { list.append(.app(only)) }
                 list.append(.app(appID))
             }
         } else {
+            folder.apps = alive
             layout.folders[folderID] = folder
             if let index = list.firstIndex(of: .folder(folderID)) {
                 list.insert(.app(appID), at: index + 1)
@@ -344,6 +353,15 @@ final class Library {
             }
         }
         setItems(list, saveNow: true)
+    }
+
+    func moveInsideFolder(appID: String, folderID: String, to index: Int) {
+        guard var folder = layout.folders[folderID] else { return }
+        let visible = folder.apps.filter { apps[$0] != nil }
+        let next = OrderOps.place(tokens: visible, token: appID, slot: index)
+        guard next != visible else { return }
+        folder.apps = next + folder.apps.filter { apps[$0] == nil }
+        layout.folders[folderID] = folder
     }
 
     func renameFolder(_ id: String, to name: String) {
@@ -437,10 +455,14 @@ final class Library {
         for app in scanned { map[app.id] = app }
         apps = map
         let valid = Set(map.keys)
-        layout.hidden = layout.hidden.filter { valid.contains($0) }
-        for key in Array(layout.folders.keys) {
-            layout.folders[key]?.apps.removeAll { !valid.contains($0) || layout.hidden.contains($0) }
+        let hidden = layout.hidden.filter { valid.contains($0) }
+        layout.hidden = hidden
+        let hiddenSet = Set(hidden)
+        var folders = layout.folders
+        for key in folders.keys {
+            folders[key]?.apps.removeAll { !valid.contains($0) || hiddenSet.contains($0) }
         }
+        layout.folders = folders
         pruneEmptyFolders()
 
         var seen = Set<String>()
@@ -492,8 +514,10 @@ final class Library {
     }
 
     private func pruneEmptyFolders() {
+        let hidden = Set(layout.hidden)
+        let known = apps
         let empty = layout.folders.filter { _, folder in
-            !folder.apps.contains { apps[$0] != nil && !layout.hidden.contains($0) }
+            !folder.apps.contains { known[$0] != nil && !hidden.contains($0) }
         }.map(\.key)
         for id in empty {
             layout.folders.removeValue(forKey: id)
@@ -501,11 +525,16 @@ final class Library {
         }
     }
 
-    private func nextFolderName() -> String {
+    private func folderName(for first: AppInfo, and second: AppInfo) -> String {
+        let left = AppArrangement.key(for: first)
+        let right = AppArrangement.key(for: second)
+        let base = left.kind == right.kind && left.kind != .other
+            ? AppArrangement.title(left.kind)
+            : "文件夹"
         let names = Set(layout.folders.values.map(\.name))
-        if !names.contains("文件夹") { return "文件夹" }
+        if !names.contains(base) { return base }
         var index = 2
-        while names.contains("文件夹 \(index)") { index += 1 }
-        return "文件夹 \(index)"
+        while names.contains("\(base) \(index)") { index += 1 }
+        return "\(base) \(index)"
     }
 }
